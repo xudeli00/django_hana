@@ -48,13 +48,15 @@ class CursorWrapper(object):
         Hana doesn't support %s placeholders
         Wrapper to convert all %s placeholders to qmark(?) placeholders
     """
+    codes_for_integrityerror = (301,)
 
     def __init__(self, cursor, db):
         self.cursor = cursor
         self.db = db
+        self.is_hana = True
 
     def set_dirty(self):
-        if self.db.is_managed():
+        if not self.db.get_autocommit():
             self.db.set_dirty()
 
     def __getattr__(self, attr):
@@ -72,18 +74,34 @@ class CursorWrapper(object):
         """
             execute with replaced placeholders
         """
-        self.cursor.execute(self._replace_params(sql,len(params) if params else 0),params)
+        try:
+            self.cursor.execute(self._replace_params(sql,len(params) if params else 0),params)
+        except Database.IntegrityError as e:
+            six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+        except Database.Error as e:
+            # Map some error codes to IntegrityError, since they seem to be
+            # misclassified and Django would prefer the more logical place.
+            if e[0] in self.codes_for_integrityerror:
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            six.reraise(utils.DatabaseError, utils.DatabaseError(*tuple(e.args)), sys.exc_info()[2])
 
     def executemany(self, sql, param_list):
-        self.cursor.executemany(self._replace_params(sql,len(param_list[0]) if param_list and len(param_list)>0 else 0),param_list)
+        try:
+            self.cursor.executemany(self._replace_params(sql,len(param_list[0]) if param_list and len(param_list)>0 else 0),param_list)
+        except Database.IntegrityError as e:
+            six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+        except Database.Error as e:
+            # Map some error codes to IntegrityError, since they seem to be
+            # misclassified and Django would prefer the more logical place.
+            if e[0] in self.codes_for_integrityerror:
+                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
+            six.reraise(utils.DatabaseError, utils.DatabaseError(*tuple(e.args)), sys.exc_info()[2])
 
     def _replace_params(self,sql,params_count):
         """
-            converts %s style placeholders to ?
+        converts %s style placeholders to ?
         """
-        str_placeholders='?' * params_count
-
-        return sql % tuple([p for p in str_placeholders]);
+        return sql % tuple('?'*params_count)
 
 
 class CursorDebugWrapper(CursorWrapper):
@@ -195,23 +213,23 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         self.default_schema=self.settings_dict['NAME']
         # make it upper case
         self.default_schema=self.default_schema.upper()
-
+        self.create_or_set_default_schema()
 
     def _cursor(self):
         self.ensure_connection()
-        cursor = self.connection.cursor()
-        self.create_or_set_default_schema(cursor)
-        return cursor
+        return self.connection.cursor()
 
     def ensure_connection(self):
         if self.connection is None:
             self.connect()
 
     def cursor(self):
-        self.validate_thread_sharing()
-        if (self.use_debug_cursor or
-            (self.use_debug_cursor is None and settings.DEBUG)):
-            cursor = self.make_debug_cursor(self._cursor())
+        # Call parent, in order to support cursor overriding from apps like Django Debug Toolbar
+        # self.BaseDatabaseWrapper API is very asymetrical here - uses make_debug_cursor() for the
+        # debug cursor, but directly instantiates urils.CursorWrapper for the regular one
+        result = super (DatabaseWrapper, self).cursor ()
+        if getattr(result,'is_hana',False):
+            cursor = result
         else:
             cursor = CursorWrapper(self._cursor(), self)
         return cursor
@@ -220,16 +238,17 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         return CursorDebugWrapper(cursor, self)
 
 
-    def create_or_set_default_schema(self,cursor):
+    def create_or_set_default_schema(self):
         """
             create if doesn't exist and then make it default
         """
+        cursor = self.cursor()
         cursor.execute("select (1) as a from schemas where schema_name='%s'" % self.default_schema)
         res=cursor.fetchone()
         if not res:
             cursor.execute("create schema %s" % self.default_schema)
         cursor.execute("set schema "+self.default_schema)
-    
+
     def _enter_transaction_management(self, managed):
         """
             Disables autocommit on entering a transaction
